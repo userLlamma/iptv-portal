@@ -1,0 +1,23 @@
+# Python virtual environments
+iptvenv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# IDEs and editors
+.vscode/
+.idea/
+
+# Optional: test coverage reports
+htmlcov/
+.coverage

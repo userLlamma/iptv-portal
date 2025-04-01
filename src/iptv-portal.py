@@ -5,6 +5,7 @@ IPTV多源聚合与自动更新系统
 - 提供API和M3U生成服务
 """
 
+import sys
 import os
 import re
 import time
@@ -17,6 +18,16 @@ import sqlite3
 from urllib.parse import urlparse
 from flask import Flask, request, Response, jsonify, render_template
 
+# 添加源目录到Python路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# 确保当前目录在Python路径中
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
+
+# 导入verify-streams模块中的函数
+# 注意：Python导入时会将破折号替换为下划线
+from verify_streams import verify_stream
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -28,7 +39,8 @@ logger = logging.getLogger("iptv-system")
 # 定义IPTV源 - 这些URL需要根据实际情况更新
 IPTV_SOURCES = [
     "https://iptv-org.github.io/iptv/index.m3u",
-    "https://raw.githubusercontent.com/yuanhsing/iptv/main/cn.m3u",
+    "https://raw.githubusercontent.com/benmoose39/YouTube_to_m3u/refs/heads/main/youtube.m3u",
+    "https://github.com/Free-TV/IPTV/blob/master/playlist.m3u8",
     # 更多来源...可以添加其他GitHub上的开源IPTV资源
 ]
 
@@ -139,37 +151,7 @@ def determine_group(channel_name):
     
     return "其他"
 
-def verify_stream(url, timeout=10):
-    """验证流媒体URL是否可访问"""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        start_time = time.time()
-        
-        # 对于m3u8文件，尝试获取内容而不是直接打开流
-        if url.endswith('.m3u8'):
-            response = requests.get(url, headers=headers, timeout=timeout, stream=True)
-            content = next(response.iter_content(chunk_size=1024), None)
-            if content and response.status_code == 200:
-                return True, time.time() - start_time, ""
-            else:
-                return False, 0, f"HTTP错误: {response.status_code}"
-        
-        # 对于直接流，仅检查头信息
-        else:
-            response = requests.head(url, headers=headers, timeout=timeout)
-            if response.status_code == 200:
-                return True, time.time() - start_time, ""
-            else:
-                return False, 0, f"HTTP错误: {response.status_code}"
-    
-    except requests.exceptions.Timeout:
-        return False, 0, "连接超时"
-    except requests.exceptions.ConnectionError:
-        return False, 0, "连接错误"
-    except Exception as e:
-        return False, 0, str(e)
+
 
 def fetch_and_process_source(source_url):
     """获取并处理单个IPTV源"""
@@ -229,6 +211,7 @@ def collect_from_all_sources():
     logger.info(f"收集完成，总共获取 {total_channels} 个频道")
     return total_channels
 
+# 修改verify_channels函数，确保创建新的连接
 def verify_channels(max_channels=None, only_check_inactive=False):
     """验证频道的有效性"""
     conn = sqlite3.connect(DB_PATH)
@@ -243,7 +226,9 @@ def verify_channels(max_channels=None, only_check_inactive=False):
         cursor.execute("SELECT id, name, url FROM channels ORDER BY last_checked ASC LIMIT ?", 
                       (max_channels or 100,))
     
-    channels = cursor.fetchall()
+    channels = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
     logger.info(f"准备验证 {len(channels)} 个频道")
     
     def check_single_channel(channel):
@@ -252,28 +237,39 @@ def verify_channels(max_channels=None, only_check_inactive=False):
         channel_url = channel['url']
         
         logger.debug(f"验证频道: {channel_name}")
-        is_valid, response_time, error = verify_stream(channel_url)
         
-        # 更新频道状态
-        cursor = conn.cursor()
-        if is_valid:
-            cursor.execute(
-                "UPDATE channels SET last_checked = CURRENT_TIMESTAMP, is_active = 1, success_count = success_count + 1 WHERE id = ?",
-                (channel_id,)
+        # 使用导入的verify_stream函数，传递数据库路径
+        is_valid, response_time, error = verify_stream(channel_url, timeout=10, db_path=DB_PATH)
+        
+        # 创建新的数据库连接（解决SQLite多线程问题）
+        local_conn = sqlite3.connect(DB_PATH)
+        local_cursor = local_conn.cursor()
+        
+        try:
+            # 更新频道状态
+            if is_valid:
+                local_cursor.execute(
+                    "UPDATE channels SET last_checked = CURRENT_TIMESTAMP, is_active = 1, success_count = success_count + 1 WHERE id = ?",
+                    (channel_id,)
+                )
+            else:
+                local_cursor.execute(
+                    "UPDATE channels SET last_checked = CURRENT_TIMESTAMP, is_active = 0, fail_count = fail_count + 1 WHERE id = ?",
+                    (channel_id,)
+                )
+            
+            # 记录检查历史
+            local_cursor.execute(
+                "INSERT INTO check_history (channel_id, status, response_time, error_message) VALUES (?, ?, ?, ?)",
+                (channel_id, 1 if is_valid else 0, response_time, error)
             )
-        else:
-            cursor.execute(
-                "UPDATE channels SET last_checked = CURRENT_TIMESTAMP, is_active = 0, fail_count = fail_count + 1 WHERE id = ?",
-                (channel_id,)
-            )
+            
+            local_conn.commit()
+        except Exception as e:
+            logger.error(f"更新频道状态时出错: {str(e)}")
+        finally:
+            local_conn.close()
         
-        # 记录检查历史
-        cursor.execute(
-            "INSERT INTO check_history (channel_id, status, response_time, error_message) VALUES (?, ?, ?, ?)",
-            (channel_id, 1 if is_valid else 0, response_time, error)
-        )
-        
-        conn.commit()
         return is_valid, channel_name
     
     # 多线程验证
@@ -284,7 +280,6 @@ def verify_channels(max_channels=None, only_check_inactive=False):
     valid_count = sum(1 for valid, _ in results if valid)
     logger.info(f"验证完成: {valid_count}/{len(channels)} 个频道有效")
     
-    conn.close()
     return valid_count, len(channels)
 
 def generate_m3u_content(group_filter=None):

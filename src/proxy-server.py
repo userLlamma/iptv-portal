@@ -544,29 +544,41 @@ def proxy_segment(channel_id, segment_url=None):
         'Connection': 'keep-alive'
     }
     
-    # 直接从源获取，不使用缓存
-    response = requests.get(segment_url, headers=custom_headers, stream=True, timeout=15)
-    
-    if response.status_code != 200:
-        return Response("无法获取分段", status=503)
-    
-    # 创建响应
-    resp = Response(
-        response.content,
-        status=response.status_code
-    )
-    
-    # 复制所有原始头信息
-    excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-    for name, value in response.headers.items():
-        if name.lower() not in excluded_headers:
-            resp.headers[name] = value
-    
-    # 添加CORS和缓存控制
-    resp.headers['Access-Control-Allow-Origin'] = '*'
-    resp.headers['Cache-Control'] = 'no-cache'
-    
-    return resp
+    try:
+        # 创建请求对象
+        req = requests.Request('GET', segment_url, headers=custom_headers)
+        prepared = req.prepare()
+        
+        # 创建会话并发送请求
+        s = requests.Session()
+        resp = s.send(prepared, stream=True, timeout=15)
+        
+        if resp.status_code != 200:
+            return Response("无法获取分段", status=503)
+        
+        # 创建迭代器来流式传输内容
+        def generate():
+            for chunk in resp.iter_content(chunk_size=8192):
+                yield chunk
+        
+        # 设置响应头
+        headers = {}
+        for name, value in resp.headers.items():
+            if name.lower() not in ['content-encoding', 'transfer-encoding']:
+                headers[name] = value
+        
+        headers['Access-Control-Allow-Origin'] = '*'
+        
+        # 返回流式响应
+        return Response(
+            stream_with_context(generate()),
+            headers=headers,
+            status=resp.status_code,
+            content_type=resp.headers.get('content-type', 'video/MP2T')
+        )
+    except Exception as e:
+        logger.error(f"代理分段错误: {str(e)}")
+        return Response(f"代理错误: {str(e)}", status=500)
 
 def add_channel_source(channel_id, url, priority=100):
     """添加频道源"""

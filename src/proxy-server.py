@@ -867,6 +867,21 @@ def clean_cache():
     except Exception as e:
         logger.error(f"缓存清理错误: {str(e)}")
 
+def update_cctv_sources():
+    """定期更新CCTV源"""
+    from cctv_discovery import discover_and_update
+    
+    while True:
+        try:
+            logger.info("开始更新CCTV源...")
+            discover_and_update(DB_PATH)
+            logger.info("CCTV源更新完成")
+        except Exception as e:
+            logger.error(f"更新CCTV源出错: {str(e)}")
+        
+        # 每6小时更新一次
+        time.sleep(6 * 60 * 60)
+
 def main():
     """启动代理服务器"""
     # 初始化数据库
@@ -880,6 +895,9 @@ def main():
     
     # 启动清理线程
     threading.Thread(target=clean_cache_task, daemon=True).start()
+    
+    # 启动CCTV源更新线程
+    threading.Thread(target=update_cctv_sources, daemon=True).start()
     
     # 启动Flask应用
     logger.info("IPTV代理服务器启动中...")

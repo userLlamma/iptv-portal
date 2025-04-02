@@ -312,10 +312,14 @@ def proxy_hls_manifest(channel_id, source_url):
         escaped_url = quote(segment_url)
         proxy_url = f"/proxy/segment/{channel_id}?url={escaped_url}"
         
-        return match.group(0).replace(match.group(1), proxy_url)
+        return proxy_url
     
-    # 替换所有非注释行（通常是TS分段URL）
-    processed_content = re.sub(r'(?<=\n)([^#][^\n]+)', rewrite_url, content)
+    # 修改正则表达式以更精确地匹配TS文件行
+    processed_content = re.sub(
+        r'(?<=\n)([^#][^\n]+\.ts[^\n]*)', 
+        rewrite_url, 
+        content
+    )
     
     return Response(
         processed_content,

@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("iptv-proxy")
 
 DB_PATH = "iptv_proxy.db"
-CACHE_ENABLED = True
+CACHE_ENABLED = False
 CACHE_DIR = "cache"
 LOGO_CACHE_DIR = os.path.join(CACHE_DIR, "logos")
 CACHE_TTL = 3600  # 缓存有效期1小时
@@ -297,22 +297,21 @@ def proxy_hls_manifest(channel_id, source_url):
     content = response.text
     base_url = source_url.rsplit('/', 1)[0] + '/'
     
-    # 处理内容
+    # 保留原始内容头部（包括#EXT-X-VERSION等）
     lines = content.splitlines()
     processed_lines = []
     
     for line in lines:
-        # 保留注释和标签行
         if line.startswith('#'):
+            # 保留所有标签行
             processed_lines.append(line)
-        # 处理URL行 (非注释行)
-        elif line.strip():  # 确保不是空行
+        elif line.strip():
+            # 处理URL行
             segment_url = line.strip()
             
-            # 构建完整URL (相对URL转为绝对URL)
+            # 构建完整URL
             if not segment_url.startswith('http'):
                 if segment_url.startswith('/'):
-                    # 根路径URL
                     parsed_url = urlparse(source_url)
                     full_url = f"{parsed_url.scheme}://{parsed_url.netloc}{segment_url}"
                 else:
@@ -330,7 +329,10 @@ def proxy_hls_manifest(channel_id, source_url):
     return Response(
         processed_content,
         content_type='application/vnd.apple.mpegurl',
-        headers={'Access-Control-Allow-Origin': '*'}
+        headers={
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'no-cache'
+        }
     )
 
 def proxy_mpd_manifest(channel_id, source_url):
@@ -533,85 +535,33 @@ def proxy_segment(channel_id, segment_url=None):
         segment_url = unquote(segment_url)
     
     # 对CCTV流媒体使用特殊处理
-    custom_headers = None
-    if ('cctv' in segment_url.lower() or 
-        'volcfcdn.com' in segment_url.lower() or 
-        'myqcloud.com' in segment_url.lower() or
-        'liveplay.myqcloud.com' in segment_url.lower()):
-        custom_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Accept-Language': 'en,zh-CN;q=0.9,zh;q=0.8',
-            'Origin': 'https://tv.cctv.com',
-            'Referer': 'https://tv.cctv.com/',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'cross-site'
-        }
+    custom_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en,zh-CN;q=0.9,zh;q=0.8',
+        'Origin': 'https://tv.cctv.com',
+        'Referer': 'https://tv.cctv.com/',
+        'Connection': 'keep-alive'
+    }
     
-    # 生成段ID用于缓存 - 更新以处理新的TS命名格式
-    segment_id = urlparse(segment_url).path.split('/')[-1]
-    # 处理数字后缀的TS文件，例如 cdrmldcctv2_1_td-435896241.ts
-    if '-' in segment_id and segment_id.endswith('.ts'):
-        segment_id = segment_id.replace('.ts', '') + '.ts'  # 保留完整标识符用于缓存
+    # 直接从源获取，不使用缓存
+    response = requests.get(segment_url, headers=custom_headers, stream=True, timeout=15)
     
-    cache_path = get_cache_path(channel_id, segment_id)
-    
-    # 检查缓存
-    if CACHE_ENABLED and is_cache_valid(cache_path):
-        logger.debug(f"使用缓存提供分段: {segment_id}")
-        
-        def generate_from_cache():
-            with open(cache_path, 'rb') as f:
-                data = f.read()
-                yield data
-        
-        return Response(
-            stream_with_context(generate_from_cache()),
-            content_type='video/MP2T',
-            headers={'Access-Control-Allow-Origin': '*'}
-        )
-    
-    # 从源获取
-    response = fetch_with_retry(segment_url, stream=True, headers=custom_headers)
-    
-    if not response:
+    if response.status_code != 200:
         return Response("无法获取分段", status=503)
     
-    # 设置正确的内容类型
-    content_type = 'video/MP2T'  # 默认MPEG-TS
-    if segment_url.endswith('.m4s'):
-        content_type = 'video/iso.segment'
-    elif segment_url.endswith('.mp4'):
-        content_type = 'video/mp4'
-    elif 'content-type' in response.headers:
-        content_type = response.headers['content-type']
+    # 保留原始内容类型
+    content_type = response.headers.get('content-type', 'video/MP2T')
     
-    # 缓存并流式传输
-    def generate():
-        cache_data = bytearray()
-        
-        try:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    if CACHE_ENABLED:
-                        cache_data.extend(chunk)
-                    yield chunk
-            
-            # 保存到缓存
-            if CACHE_ENABLED and cache_data:
-                try:
-                    with open(cache_path, 'wb') as f:
-                        f.write(cache_data)
-                except Exception as e:
-                    logger.error(f"缓存分段错误: {str(e)}")
-        except Exception as e:
-            logger.error(f"分段传输错误: {str(e)}")
-    
+    # 直接流式传输二进制数据，不做任何修改
     return Response(
-        stream_with_context(generate()),
+        response.raw,
         content_type=content_type,
-        headers={'Access-Control-Allow-Origin': '*'}
+        direct_passthrough=True,  # 重要：直接传递字节流
+        headers={
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'no-cache'
+        }
     )
 
 def add_channel_source(channel_id, url, priority=100):

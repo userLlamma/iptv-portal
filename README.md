@@ -17,12 +17,18 @@ pip install -r requirements.txt
 
 #### 运行代理服务器:
 ```bash
+python3 -m venv iptvenv
+
+source iptvenv/bin/activate
+
+pip install -r requirements.txt
+
 nohup python src/proxy-server.py > proxy-server.log 2>&1 &
 ```
 
 #### 配合M3U转换工具使用:
 ```bash
-bashCopypython src/m3u-to-proxy.py 你的M3U文件 --proxy http://你的服务器IP:5000
+python src/m3u-to-proxy.py 你的M3U文件 --proxy http://你的服务器IP:5000
 ```
 
 #### API访问点:

@@ -306,7 +306,7 @@ def proxy_hls_manifest(channel_id, source_url):
         if line.startswith('#'):
             processed_lines.append(line)
         # 处理URL行 (非注释行)
-        else:
+        elif line.strip():  # 确保不是空行
             segment_url = line.strip()
             
             # 构建完整URL (相对URL转为绝对URL)
@@ -536,17 +536,25 @@ def proxy_segment(channel_id, segment_url=None):
     custom_headers = None
     if ('cctv' in segment_url.lower() or 
         'volcfcdn.com' in segment_url.lower() or 
-        'myqcloud.com' in segment_url.lower()):
+        'myqcloud.com' in segment_url.lower() or
+        'liveplay.myqcloud.com' in segment_url.lower()):
         custom_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
             'Accept': '*/*',
             'Accept-Language': 'en,zh-CN;q=0.9,zh;q=0.8',
             'Origin': 'https://tv.cctv.com',
             'Referer': 'https://tv.cctv.com/',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'cross-site'
         }
     
-    # 生成段ID用于缓存
+    # 生成段ID用于缓存 - 更新以处理新的TS命名格式
     segment_id = urlparse(segment_url).path.split('/')[-1]
+    # 处理数字后缀的TS文件，例如 cdrmldcctv2_1_td-435896241.ts
+    if '-' in segment_id and segment_id.endswith('.ts'):
+        segment_id = segment_id.replace('.ts', '') + '.ts'  # 保留完整标识符用于缓存
+    
     cache_path = get_cache_path(channel_id, segment_id)
     
     # 检查缓存

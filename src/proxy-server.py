@@ -882,10 +882,30 @@ def update_cctv_sources():
         # 每6小时更新一次
         time.sleep(6 * 60 * 60)
 
+def disable_outdated_cctv_urls():
+    """禁用已过期的CCTV URL"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # 标记所有旧格式的URL为不活跃
+    cursor.execute("""
+    UPDATE channel_sources 
+    SET is_active = 0 
+    WHERE channel_id LIKE 'cctv%' AND 
+    (url LIKE '%volcfcdn.com%' OR url LIKE '%wscdns.com%')
+    """)
+    
+    conn.commit()
+    conn.close()
+    logger.info("已禁用过期的CCTV URL")
+
 def main():
     """启动代理服务器"""
     # 初始化数据库
     init_database()
+
+    # 禁用过期的CCTV URL
+    disable_outdated_cctv_urls()
     
     # 启动定期清理缓存的线程
     def clean_cache_task():

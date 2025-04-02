@@ -294,25 +294,27 @@ def proxy_hls_manifest(channel_id, source_url):
     content = response.text
     base_url = source_url.rsplit('/', 1)[0] + '/'
     
-    # 将URL路径转换为代理URL
+    # 将绝对路径转换为相对路径
     def rewrite_url(match):
         segment_url = match.group(1).strip()
         
-        # 如果是相对路径，转换为绝对路径
-        if not segment_url.startswith('http'):
-            if segment_url.startswith('/'):
-                parsed_url = urlparse(source_url)
-                segment_url = f"{parsed_url.scheme}://{parsed_url.netloc}{segment_url}"
-            else:
-                segment_url = f"{base_url}{segment_url}"
+        # 如果是完整URL则保留，否则添加基础路径
+        if segment_url.startswith('http'):
+            pass
+        elif segment_url.startswith('/'):
+            # 根路径URL
+            parsed_url = urlparse(source_url)
+            segment_url = f"{parsed_url.scheme}://{parsed_url.netloc}{segment_url}"
+        else:
+            segment_url = f"{base_url}{segment_url}"
         
-        # 添加代理前缀，转义URL
+        # 重要修改：始终使用channel_id作为路径参数，将完整URL作为查询参数
         escaped_url = quote(segment_url)
         proxy_url = f"/proxy/segment/{channel_id}?url={escaped_url}"
         
         return match.group(0).replace(match.group(1), proxy_url)
     
-    # 替换所有TS分段URL
+    # 替换所有非注释行（通常是TS分段URL）
     processed_content = re.sub(r'(?<=\n)([^#][^\n]+)', rewrite_url, content)
     
     return Response(

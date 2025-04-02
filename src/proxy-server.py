@@ -550,19 +550,23 @@ def proxy_segment(channel_id, segment_url=None):
     if response.status_code != 200:
         return Response("无法获取分段", status=503)
     
-    # 保留原始内容类型
-    content_type = response.headers.get('content-type', 'video/MP2T')
-    
-    # 直接流式传输二进制数据，不做任何修改
-    return Response(
-        response.raw,
-        content_type=content_type,
-        direct_passthrough=True,  # 重要：直接传递字节流
-        headers={
-            'Access-Control-Allow-Origin': '*',
-            'Cache-Control': 'no-cache'
-        }
+    # 创建响应
+    resp = Response(
+        response.content,
+        status=response.status_code
     )
+    
+    # 复制所有原始头信息
+    excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+    for name, value in response.headers.items():
+        if name.lower() not in excluded_headers:
+            resp.headers[name] = value
+    
+    # 添加CORS和缓存控制
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['Cache-Control'] = 'no-cache'
+    
+    return resp
 
 def add_channel_source(channel_id, url, priority=100):
     """添加频道源"""

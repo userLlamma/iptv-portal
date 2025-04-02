@@ -295,12 +295,15 @@ def proxy_hls_manifest(channel_id, source_url):
         return Response("无法获取HLS清单", status=404)
     
     content = response.text
+    logger.debug(f"原始m3u8内容:\n{content}")  # 记录原始内容便于调试
+    
     base_url = source_url.rsplit('/', 1)[0] + '/'
     
-    # 保留原始内容头部（包括#EXT-X-VERSION等）
+    # 处理内容行
     lines = content.splitlines()
     processed_lines = []
     
+    # 保留原始头部标签
     for line in lines:
         if line.startswith('#'):
             # 保留所有标签行
@@ -325,6 +328,7 @@ def proxy_hls_manifest(channel_id, source_url):
             processed_lines.append(proxy_url)
     
     processed_content = '\n'.join(processed_lines)
+    logger.debug(f"处理后m3u8内容:\n{processed_content}")  # 记录处理后内容
     
     return Response(
         processed_content,

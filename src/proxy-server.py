@@ -294,32 +294,34 @@ def proxy_hls_manifest(channel_id, source_url):
     content = response.text
     base_url = source_url.rsplit('/', 1)[0] + '/'
     
-    # 将绝对路径转换为相对路径
-    def rewrite_url(match):
-        segment_url = match.group(1).strip()
-        
-        # 如果是完整URL则保留，否则添加基础路径
-        if segment_url.startswith('http'):
-            pass
-        elif segment_url.startswith('/'):
-            # 根路径URL
-            parsed_url = urlparse(source_url)
-            segment_url = f"{parsed_url.scheme}://{parsed_url.netloc}{segment_url}"
-        else:
-            segment_url = f"{base_url}{segment_url}"
-        
-        # 重要修改：始终使用channel_id作为路径参数，将完整URL作为查询参数
-        escaped_url = quote(segment_url)
-        proxy_url = f"/proxy/segment/{channel_id}?url={escaped_url}"
-        
-        return proxy_url
+    # 检查内容并区分主播放列表和子播放列表
+    lines = content.splitlines()
+    processed_lines = []
     
-    # 修改正则表达式以更精确地匹配TS文件行
-    processed_content = re.sub(
-        r'(?<=\n)([^#][^\n]+\.ts[^\n]*)', 
-        rewrite_url, 
-        content
-    )
+    for line in lines:
+        # 保留注释和标签行
+        if line.startswith('#'):
+            processed_lines.append(line)
+        # 处理URL行 (非注释行)
+        else:
+            segment_url = line.strip()
+            
+            # 构建完整URL (相对URL转为绝对URL)
+            if not segment_url.startswith('http'):
+                if segment_url.startswith('/'):
+                    # 根路径URL
+                    parsed_url = urlparse(source_url)
+                    segment_url = f"{parsed_url.scheme}://{parsed_url.netloc}{segment_url}"
+                else:
+                    segment_url = f"{base_url}{segment_url}"
+            
+            # 构建代理URL
+            escaped_url = quote(segment_url)
+            proxy_url = f"/proxy/segment/{channel_id}?url={escaped_url}"
+            processed_lines.append(proxy_url)
+    
+    # 重组处理后的内容
+    processed_content = '\n'.join(processed_lines)
     
     return Response(
         processed_content,

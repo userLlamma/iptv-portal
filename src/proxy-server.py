@@ -253,11 +253,14 @@ def fetch_with_retry(url, stream=False, max_retries=3, timeout=10, headers=None)
         'myqcloud.com' in url.lower() or 
         'myalicdn.com' in url.lower()):
         default_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
             'Accept': '*/*',
             'Accept-Language': 'en,zh-CN;q=0.9,zh;q=0.8',
             'Origin': 'https://tv.cctv.com',
             'Referer': 'https://tv.cctv.com/',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'cross-site'
         }
     
     if headers:
@@ -294,7 +297,7 @@ def proxy_hls_manifest(channel_id, source_url):
     content = response.text
     base_url = source_url.rsplit('/', 1)[0] + '/'
     
-    # 检查内容并区分主播放列表和子播放列表
+    # 处理内容
     lines = content.splitlines()
     processed_lines = []
     
@@ -311,16 +314,17 @@ def proxy_hls_manifest(channel_id, source_url):
                 if segment_url.startswith('/'):
                     # 根路径URL
                     parsed_url = urlparse(source_url)
-                    segment_url = f"{parsed_url.scheme}://{parsed_url.netloc}{segment_url}"
+                    full_url = f"{parsed_url.scheme}://{parsed_url.netloc}{segment_url}"
                 else:
-                    segment_url = f"{base_url}{segment_url}"
+                    full_url = f"{base_url}{segment_url}"
+            else:
+                full_url = segment_url
             
             # 构建代理URL
-            escaped_url = quote(segment_url)
+            escaped_url = quote(full_url)
             proxy_url = f"/proxy/segment/{channel_id}?url={escaped_url}"
             processed_lines.append(proxy_url)
     
-    # 重组处理后的内容
     processed_content = '\n'.join(processed_lines)
     
     return Response(

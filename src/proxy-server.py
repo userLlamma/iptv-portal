@@ -1,10 +1,9 @@
+#!/usr/bin/env python3
 """
-增强型IPTV代理服务器
-- 支持多种流媒体格式(HLS/MPEG-TS/FLV/MPD)
-- 带缓存机制减少源服务器负担
-- 多路径自动切换保证稳定性
-- 支持频道台标和EPG关联
-- 特别支持MyTV Super的MPD格式
+IPTV代理服务器
+- 支持多种流媒体格式(HLS/MPEG-TS/MPD)
+- 特别支持CCTV流和MyTV Super MPD流
+- 配合m3u-to-proxy.py使用
 """
 
 import os
@@ -15,37 +14,28 @@ import logging
 import sqlite3
 import requests
 import threading
-import traceback
 import xml.etree.ElementTree as ET
-from urllib.parse import urlparse, urlencode, parse_qs, quote, unquote
-from flask import Flask, request, Response, stream_with_context, jsonify, render_template_string, send_file
+from urllib.parse import urlparse, quote, unquote
+from flask import Flask, request, Response, stream_with_context, jsonify, send_file
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler("iptv_proxy.log"), logging.StreamHandler()]
-)
+# 配置
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("iptv-proxy")
 
-# 数据库路径
 DB_PATH = "iptv_proxy.db"
-
-# 全局缓存设置
 CACHE_ENABLED = True
 CACHE_DIR = "cache"
 LOGO_CACHE_DIR = os.path.join(CACHE_DIR, "logos")
 CACHE_TTL = 3600  # 缓存有效期1小时
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-
-# MyTV Super配置
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/91.0.4472.124 Safari/537.36"
 MYTV_SUPER_TOKEN = os.environ.get('MYTV_SUPER_TOKEN', '')
 
+# 创建Flask应用
+app = Flask(__name__)
+
 # 确保缓存目录存在
-if not os.path.exists(CACHE_DIR):
-    os.makedirs(CACHE_DIR)
-if not os.path.exists(LOGO_CACHE_DIR):
-    os.makedirs(LOGO_CACHE_DIR)
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(LOGO_CACHE_DIR, exist_ok=True)
 
 def init_database():
     """初始化SQLite数据库"""
@@ -56,9 +46,9 @@ def init_database():
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS channel_sources (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        channel_id TEXT NOT NULL,          -- 频道标识
-        url TEXT NOT NULL,                 -- 源URL
-        priority INTEGER DEFAULT 1,        -- 优先级，数字越小优先级越高
+        channel_id TEXT NOT NULL,
+        url TEXT NOT NULL,
+        priority INTEGER DEFAULT 1,
         is_active BOOLEAN DEFAULT 1,
         last_checked TIMESTAMP,
         success_count INTEGER DEFAULT 0,
@@ -71,15 +61,15 @@ def init_database():
     # 创建频道信息表
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS channel_info (
-        channel_id TEXT PRIMARY KEY,       -- 频道标识，唯一
-        display_name TEXT,                 -- 显示名称
-        logo_url TEXT,                     -- 台标URL
-        epg_id TEXT,                       -- EPG ID
-        group_title TEXT,                  -- 分组
-        description TEXT,                  -- 描述
-        country TEXT,                      -- 国家/地区
-        language TEXT,                     -- 语言
-        categories TEXT,                   -- 分类，JSON格式的数组
+        channel_id TEXT PRIMARY KEY,
+        display_name TEXT,
+        logo_url TEXT,
+        epg_id TEXT,
+        group_title TEXT,
+        description TEXT,
+        country TEXT,
+        language TEXT,
+        categories TEXT,
         added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
@@ -87,34 +77,21 @@ def init_database():
     # 创建台标缓存表
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS logo_cache (
-        logo_url TEXT PRIMARY KEY,        -- 原始台标URL
-        local_path TEXT,                  -- 本地存储路径
+        logo_url TEXT PRIMARY KEY,
+        local_path TEXT,
         last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
     
-    # 创建频道访问日志
+    # 创建访问日志
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS access_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         channel_id TEXT NOT NULL,
         source_url TEXT NOT NULL,
         access_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        user_ip TEXT,
-        user_agent TEXT,
         status TEXT,
         bytes_sent INTEGER DEFAULT 0
-    )
-    ''')
-    
-    # 创建EPG来源表
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS epg_sources (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,               -- 来源名称
-        url TEXT UNIQUE NOT NULL,         -- EPG XML URL
-        is_active BOOLEAN DEFAULT 1,
-        last_updated TIMESTAMP
     )
     ''')
     
@@ -122,15 +99,14 @@ def init_database():
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS mytv_tokens (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        token TEXT UNIQUE NOT NULL,       -- MyTV Super token
-        expiry TIMESTAMP,                 -- 过期时间
+        token TEXT UNIQUE NOT NULL,
+        expiry TIMESTAMP,
         added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
     
     conn.commit()
     conn.close()
-    logger.info("数据库初始化完成")
     
     # 如果环境变量中有MyTV Super token，添加到数据库
     if MYTV_SUPER_TOKEN:
@@ -145,22 +121,16 @@ def add_mytv_token(token, expiry=None):
     cursor = conn.cursor()
     
     try:
-        if expiry:
-            cursor.execute(
-                "INSERT OR REPLACE INTO mytv_tokens (token, expiry) VALUES (?, ?)",
-                (token, expiry)
-            )
-        else:
-            # 如果没有提供过期时间，默认30天
-            expiry_date = time.strftime('%Y-%m-%d %H:%M:%S', 
-                                       time.localtime(time.time() + 30*24*60*60))
-            cursor.execute(
-                "INSERT OR REPLACE INTO mytv_tokens (token, expiry) VALUES (?, ?)",
-                (token, expiry_date)
-            )
+        if not expiry:
+            # 默认30天有效期
+            expiry = time.strftime('%Y-%m-%d %H:%M:%S', 
+                                time.localtime(time.time() + 30*24*60*60))
         
+        cursor.execute(
+            "INSERT OR REPLACE INTO mytv_tokens (token, expiry) VALUES (?, ?)",
+            (token, expiry)
+        )
         conn.commit()
-        logger.info("MyTV Super token添加成功")
     except Exception as e:
         logger.error(f"添加MyTV Super token失败: {str(e)}")
     finally:
@@ -182,9 +152,7 @@ def get_mytv_token():
     
     if result:
         return result[0]
-    else:
-        # 如果数据库中没有有效token，使用环境变量中的token
-        return MYTV_SUPER_TOKEN
+    return MYTV_SUPER_TOKEN
 
 def get_best_source(channel_id):
     """获取指定频道的最佳源URL"""
@@ -193,30 +161,25 @@ def get_best_source(channel_id):
     
     # 按优先级获取活跃源
     cursor.execute("""
-    SELECT url, avg_response_time 
-    FROM channel_sources 
+    SELECT url FROM channel_sources 
     WHERE channel_id = ? AND is_active = 1 
     ORDER BY priority, avg_response_time 
     LIMIT 1
     """, (channel_id,))
     
     result = cursor.fetchone()
-    conn.close()
     
-    if result:
-        return result[0]
-    else:
-        # 如果没有活跃源，尝试获取任何源（即使不活跃）
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT url FROM channel_sources WHERE channel_id = ? ORDER BY priority LIMIT 1", (channel_id,))
+    if not result:
+        # 尝试获取任何源
+        cursor.execute("""
+        SELECT url FROM channel_sources 
+        WHERE channel_id = ? 
+        ORDER BY priority LIMIT 1
+        """, (channel_id,))
         result = cursor.fetchone()
-        conn.close()
-        
-        if result:
-            return result[0]
     
-    return None
+    conn.close()
+    return result[0] if result else None
 
 def update_source_status(channel_id, url, success, response_time=0):
     """更新源状态信息"""
@@ -224,7 +187,6 @@ def update_source_status(channel_id, url, success, response_time=0):
     cursor = conn.cursor()
     
     if success:
-        # 成功时更新响应时间和成功计数
         cursor.execute("""
         UPDATE channel_sources 
         SET is_active = 1, 
@@ -234,7 +196,6 @@ def update_source_status(channel_id, url, success, response_time=0):
         WHERE channel_id = ? AND url = ?
         """, (response_time, channel_id, url))
     else:
-        # 失败时更新失败计数和状态
         cursor.execute("""
         UPDATE channel_sources 
         SET is_active = 0, 
@@ -246,103 +207,6 @@ def update_source_status(channel_id, url, success, response_time=0):
     conn.commit()
     conn.close()
 
-def add_channel_source(channel_id, url, priority=100):
-    """添加频道源"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("""
-        INSERT INTO channel_sources (channel_id, url, priority)
-        VALUES (?, ?, ?)
-        ON CONFLICT(channel_id, url) DO UPDATE SET
-        priority = ?, is_active = 1
-        """, (channel_id, url, priority, priority))
-        
-        conn.commit()
-        status = "添加成功"
-    except Exception as e:
-        status = f"添加失败: {str(e)}"
-    
-    conn.close()
-    return status
-
-def add_channel_info(channel_id, display_name=None, logo_url=None, epg_id=None, group_title=None, 
-                    description=None, country=None, language=None, categories=None):
-    """添加或更新频道信息"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # 检查频道是否已存在
-    cursor.execute("SELECT channel_id FROM channel_info WHERE channel_id = ?", (channel_id,))
-    exists = cursor.fetchone()
-    
-    if exists:
-        # 更新现有频道
-        update_fields = []
-        params = []
-        
-        if display_name is not None:
-            update_fields.append("display_name = ?")
-            params.append(display_name)
-        
-        if logo_url is not None:
-            update_fields.append("logo_url = ?")
-            params.append(logo_url)
-            # 下载logo到本地缓存
-            if logo_url:
-                download_logo(logo_url)
-        
-        if epg_id is not None:
-            update_fields.append("epg_id = ?")
-            params.append(epg_id)
-        
-        if group_title is not None:
-            update_fields.append("group_title = ?")
-            params.append(group_title)
-        
-        if description is not None:
-            update_fields.append("description = ?")
-            params.append(description)
-        
-        if country is not None:
-            update_fields.append("country = ?")
-            params.append(country)
-        
-        if language is not None:
-            update_fields.append("language = ?")
-            params.append(language)
-        
-        if categories is not None:
-            if isinstance(categories, list):
-                categories = json.dumps(categories)
-            update_fields.append("categories = ?")
-            params.append(categories)
-        
-        if update_fields:
-            params.append(channel_id)
-            query = f"UPDATE channel_info SET {', '.join(update_fields)} WHERE channel_id = ?"
-            cursor.execute(query, params)
-    else:
-        # 插入新频道
-        # 处理categories为JSON格式
-        if categories and isinstance(categories, list):
-            categories = json.dumps(categories)
-            
-        cursor.execute("""
-        INSERT INTO channel_info 
-        (channel_id, display_name, logo_url, epg_id, group_title, description, country, language, categories)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (channel_id, display_name, logo_url, epg_id, group_title, description, country, language, categories))
-        
-        # 下载logo到本地缓存
-        if logo_url:
-            download_logo(logo_url)
-    
-    conn.commit()
-    conn.close()
-    return True
-
 def get_channel_info(channel_id):
     """获取频道信息"""
     conn = sqlite3.connect(DB_PATH)
@@ -353,112 +217,23 @@ def get_channel_info(channel_id):
     result = cursor.fetchone()
     
     conn.close()
-    
-    if result:
-        return dict(result)
-    else:
-        return None
-
-def download_logo(logo_url):
-    """下载台标并缓存到本地"""
-    if not logo_url:
-        return None
-    
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # 检查是否已缓存
-    cursor.execute("SELECT local_path FROM logo_cache WHERE logo_url = ?", (logo_url,))
-    cached = cursor.fetchone()
-    
-    if cached and os.path.exists(cached[0]):
-        conn.close()
-        return cached[0]
-    
-    # 生成本地文件路径
-    parsed_url = urlparse(logo_url)
-    file_name = os.path.basename(parsed_url.path)
-    
-    # 确保文件名有效且唯一
-    if not file_name or len(file_name) < 5:
-        file_name = f"logo_{hash(logo_url) % 10000000}.png"
-    
-    local_path = os.path.join(LOGO_CACHE_DIR, file_name)
-    
-    # 下载logo
-    try:
-        response = requests.get(logo_url, timeout=10)
-        if response.status_code == 200:
-            with open(local_path, 'wb') as f:
-                f.write(response.content)
-            
-            # 更新缓存数据库
-            cursor.execute("""
-            INSERT OR REPLACE INTO logo_cache (logo_url, local_path, last_updated)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            """, (logo_url, local_path))
-            
-            conn.commit()
-            conn.close()
-            return local_path
-    except Exception as e:
-        logger.error(f"下载台标失败 {logo_url}: {str(e)}")
-    
-    conn.close()
-    return None
-
-def get_logo_path(logo_url):
-    """获取台标的本地路径，如果不存在则下载"""
-    if not logo_url:
-        return None
-    
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # 检查是否已缓存
-    cursor.execute("SELECT local_path FROM logo_cache WHERE logo_url = ?", (logo_url,))
-    cached = cursor.fetchone()
-    
-    conn.close()
-    
-    if cached and os.path.exists(cached[0]):
-        return cached[0]
-    else:
-        return download_logo(logo_url)
-
-def log_access(channel_id, source_url, user_ip, user_agent, status, bytes_sent=0):
-    """记录访问日志"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-    INSERT INTO access_logs (channel_id, source_url, user_ip, user_agent, status, bytes_sent)
-    VALUES (?, ?, ?, ?, ?, ?)
-    """, (channel_id, source_url, user_ip, user_agent, status, bytes_sent))
-    
-    conn.commit()
-    conn.close()
+    return dict(result) if result else None
 
 def get_cache_path(channel_id, segment_id=None):
     """获取缓存文件路径"""
     if segment_id:
-        # 针对HLS分段的缓存路径
         return os.path.join(CACHE_DIR, f"{channel_id}_{segment_id}.ts")
-    else:
-        # 针对直播流的缓存路径
-        return os.path.join(CACHE_DIR, f"{channel_id}.stream")
+    return os.path.join(CACHE_DIR, f"{channel_id}.stream")
 
 def is_cache_valid(cache_path):
     """检查缓存是否有效"""
     if not os.path.exists(cache_path):
         return False
     
-    # 检查文件是否过期
     file_age = time.time() - os.path.getmtime(cache_path)
     if file_age > CACHE_TTL:
         return False
     
-    # 检查文件大小是否合理
     file_size = os.path.getsize(cache_path)
     if file_size < 1024:  # 小于1KB可能是损坏的文件
         return False
@@ -476,17 +251,13 @@ def fetch_with_retry(url, stream=False, max_retries=3, timeout=10, headers=None)
     if ('cctv' in url.lower() or 
         'volcfcdn.com' in url.lower() or 
         'myqcloud.com' in url.lower() or 
-        'myalicdn.com' in url.lower() or
-        'kcdnvip.com' in url.lower()):
+        'myalicdn.com' in url.lower()):
         default_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134.0.0.0 Safari/537.36',
             'Accept': '*/*',
-            'Accept-Language': 'en,zh-CN;q=0.9,zh;q=0.8,zh-TW;q=0.7',
+            'Accept-Language': 'en,zh-CN;q=0.9,zh;q=0.8',
             'Origin': 'https://tv.cctv.com',
             'Referer': 'https://tv.cctv.com/',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'cross-site'
         }
     
     if headers:
@@ -508,25 +279,11 @@ def fetch_with_retry(url, stream=False, max_retries=3, timeout=10, headers=None)
             logger.warning(f"请求失败 (尝试 {attempt+1}/{max_retries}): {url}, 状态码: {response.status_code}")
             time.sleep(1)
         
-        except (requests.exceptions.RequestException, Exception) as e:
+        except Exception as e:
             logger.warning(f"请求异常 (尝试 {attempt+1}/{max_retries}): {url}, 错误: {str(e)}")
             time.sleep(1)
     
     return None
-
-def save_to_cache(response, cache_path):
-    """保存响应内容到缓存"""
-    try:
-        if response.status_code == 200:
-            with open(cache_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            return True
-    except Exception as e:
-        logger.error(f"缓存保存错误: {str(e)}")
-    
-    return False
 
 def proxy_hls_manifest(channel_id, source_url):
     """处理HLS播放列表"""
@@ -537,39 +294,23 @@ def proxy_hls_manifest(channel_id, source_url):
     content = response.text
     base_url = source_url.rsplit('/', 1)[0] + '/'
     
-    # 将绝对路径转换为相对路径
+    # 将URL路径转换为代理URL
     def rewrite_url(match):
         segment_url = match.group(1).strip()
         
-        # 如果是完整URL则保留，否则添加基础路径
-        if segment_url.startswith('http'):
-            pass
-        elif segment_url.startswith('/'):
-            # 根路径URL
-            parsed_url = urlparse(source_url)
-            segment_url = f"{parsed_url.scheme}://{parsed_url.netloc}{segment_url}"
-        else:
-            segment_url = f"{base_url}{segment_url}"
+        # 如果是相对路径，转换为绝对路径
+        if not segment_url.startswith('http'):
+            if segment_url.startswith('/'):
+                parsed_url = urlparse(source_url)
+                segment_url = f"{parsed_url.scheme}://{parsed_url.netloc}{segment_url}"
+            else:
+                segment_url = f"{base_url}{segment_url}"
         
         # 添加代理前缀，转义URL
         escaped_url = quote(segment_url)
         proxy_url = f"/proxy/segment/{channel_id}?url={escaped_url}"
         
-        # 对于CCTV的片段，添加特殊处理
-        is_cctv = (
-            'cctv' in segment_url.lower() or 
-            'volcfcdn.com' in segment_url.lower() or 
-            'myqcloud.com' in segment_url.lower() or 
-            'myalicdn.com' in segment_url.lower() or
-            'kcdnvip.com' in segment_url.lower()
-        )
-        
-        if is_cctv:
-            # 返回片段URL并保持原始行格式
-            return match.group(0).replace(match.group(1), proxy_url)
-        else:
-            # 标准处理
-            return match.group(0).replace(match.group(1), proxy_url)
+        return match.group(0).replace(match.group(1), proxy_url)
     
     # 替换所有TS分段URL
     processed_content = re.sub(r'(?<=\n)([^#][^\n]+)', rewrite_url, content)
@@ -585,16 +326,16 @@ def proxy_mpd_manifest(channel_id, source_url):
     # 对于MyTV Super，添加token
     if 'mytvsuper' in source_url.lower() or 'mytv' in source_url.lower():
         token = get_mytv_token()
-        if token and '?' not in source_url:
-            source_url = f"{source_url}?token={token}"
-        elif token:
-            source_url = f"{source_url}&token={token}"
+        if token:
+            source_url = f"{source_url}{'&' if '?' in source_url else '?'}token={token}"
     
     response = fetch_with_retry(source_url)
     if not response:
         return Response("无法获取MPD清单", status=404)
     
     content = response.text
+    base_url = source_url.rsplit('/', 1)[0] + '/'
+    
     try:
         # 解析XML
         root = ET.fromstring(content)
@@ -605,7 +346,6 @@ def proxy_mpd_manifest(channel_id, source_url):
             
             # 构建完整URL
             if not original_url.startswith('http'):
-                base_url = source_url.rsplit('/', 1)[0] + '/'
                 if original_url.startswith('/'):
                     parsed_url = urlparse(source_url)
                     full_url = f"{parsed_url.scheme}://{parsed_url.netloc}{original_url}"
@@ -624,8 +364,6 @@ def proxy_mpd_manifest(channel_id, source_url):
     except Exception as e:
         # 解析失败，使用正则替换
         logger.error(f"MPD解析失败，使用正则替换: {str(e)}")
-        
-        base_url = source_url.rsplit('/', 1)[0] + '/'
         
         def rewrite_url(match):
             segment_url = match.group(1).strip()
@@ -664,13 +402,8 @@ def proxy_stream(channel_id, source_url=None):
     # 对于MyTV Super链接，添加token
     if ('mytvsuper' in source_url.lower() or 'mytv' in source_url.lower()) and '.mpd' in source_url.lower():
         token = get_mytv_token()
-        if token and '?' not in source_url:
-            source_url = f"{source_url}?token={token}"
-        elif token:
-            source_url = f"{source_url}&token={token}"
-    
-    user_ip = request.remote_addr
-    user_agent = request.headers.get('User-Agent', '')
+        if token:
+            source_url = f"{source_url}{'&' if '?' in source_url else '?'}token={token}"
     
     # 判断源类型
     if source_url.endswith('.m3u8'):
@@ -692,7 +425,6 @@ def proxy_stream(channel_id, source_url=None):
                         break
                     bytes_sent += len(chunk)
                     yield chunk
-                log_access(channel_id, source_url, user_ip, user_agent, "cache_hit", bytes_sent)
         
         return Response(
             stream_with_context(generate_from_cache()),
@@ -701,9 +433,7 @@ def proxy_stream(channel_id, source_url=None):
         )
     
     # 定制头信息
-    custom_headers = {
-        'User-Agent': USER_AGENT,
-    }
+    custom_headers = {'User-Agent': USER_AGENT}
     
     # 对于MyTV Super，添加token到header
     if 'mytvsuper' in source_url.lower() or 'mytv' in source_url.lower():
@@ -719,7 +449,6 @@ def proxy_stream(channel_id, source_url=None):
     if not response:
         # 源失败，记录并返回错误
         update_source_status(channel_id, source_url, False)
-        log_access(channel_id, source_url, user_ip, user_agent, "source_error")
         return Response("无法获取流", status=503)
     
     # 成功获取，更新源状态
@@ -766,16 +495,11 @@ def proxy_stream(channel_id, source_url=None):
                     
                     yield chunk
             
-            # 记录访问日志
-            log_access(channel_id, source_url, user_ip, user_agent, "success", bytes_sent)
-            
             # 更新源状态为成功
             update_source_status(channel_id, source_url, True, response_time)
             
         except Exception as e:
             logger.error(f"流传输错误: {str(e)}")
-            log_access(channel_id, source_url, user_ip, user_agent, f"error: {str(e)}", bytes_sent)
-            
             # 更新源状态为失败
             update_source_status(channel_id, source_url, False)
         finally:
@@ -796,24 +520,17 @@ def proxy_segment(channel_id, segment_url=None):
             return Response("缺少URL参数", status=400)
         segment_url = unquote(segment_url)
     
-    user_ip = request.remote_addr
-    user_agent = request.headers.get('User-Agent', '')
-    
     # 对CCTV流媒体使用特殊处理
     custom_headers = None
     if ('cctv' in segment_url.lower() or 
         'volcfcdn.com' in segment_url.lower() or 
-        'myqcloud.com' in segment_url.lower() or 
-        'myalicdn.com' in segment_url.lower()):
+        'myqcloud.com' in segment_url.lower()):
         custom_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134.0.0.0 Safari/537.36',
             'Accept': '*/*',
-            'Accept-Language': 'en,zh-CN;q=0.9,zh;q=0.8,zh-TW;q=0.7',
+            'Accept-Language': 'en,zh-CN;q=0.9,zh;q=0.8',
             'Origin': 'https://tv.cctv.com',
             'Referer': 'https://tv.cctv.com/',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'cross-site'
         }
     
     # 生成段ID用于缓存
@@ -828,7 +545,6 @@ def proxy_segment(channel_id, segment_url=None):
             with open(cache_path, 'rb') as f:
                 data = f.read()
                 yield data
-            log_access(channel_id, segment_url, user_ip, user_agent, "segment_cache_hit", len(data))
         
         return Response(
             stream_with_context(generate_from_cache()),
@@ -840,7 +556,6 @@ def proxy_segment(channel_id, segment_url=None):
     response = fetch_with_retry(segment_url, stream=True, headers=custom_headers)
     
     if not response:
-        log_access(channel_id, segment_url, user_ip, user_agent, "segment_error")
         return Response("无法获取分段", status=503)
     
     # 设置正确的内容类型
@@ -855,12 +570,10 @@ def proxy_segment(channel_id, segment_url=None):
     # 缓存并流式传输
     def generate():
         cache_data = bytearray()
-        bytes_sent = 0
         
         try:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
-                    bytes_sent += len(chunk)
                     if CACHE_ENABLED:
                         cache_data.extend(chunk)
                     yield chunk
@@ -872,14 +585,285 @@ def proxy_segment(channel_id, segment_url=None):
                         f.write(cache_data)
                 except Exception as e:
                     logger.error(f"缓存分段错误: {str(e)}")
-            
-            log_access(channel_id, segment_url, user_ip, user_agent, "segment_success", bytes_sent)
         except Exception as e:
             logger.error(f"分段传输错误: {str(e)}")
-            log_access(channel_id, segment_url, user_ip, user_agent, f"segment_error: {str(e)}", bytes_sent)
     
     return Response(
         stream_with_context(generate()),
         content_type=content_type,
         headers={'Access-Control-Allow-Origin': '*'}
     )
+
+def add_channel_source(channel_id, url, priority=100):
+    """添加频道源"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+        INSERT INTO channel_sources (channel_id, url, priority)
+        VALUES (?, ?, ?)
+        ON CONFLICT(channel_id, url) DO UPDATE SET
+        priority = ?, is_active = 1
+        """, (channel_id, url, priority, priority))
+        
+        conn.commit()
+        status = "添加成功"
+    except Exception as e:
+        status = f"添加失败: {str(e)}"
+    
+    conn.close()
+    return status
+
+def add_channel_info(channel_id, display_name=None, logo_url=None, epg_id=None, group_title=None):
+    """添加或更新频道信息"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # 检查频道是否已存在
+    cursor.execute("SELECT channel_id FROM channel_info WHERE channel_id = ?", (channel_id,))
+    exists = cursor.fetchone()
+    
+    if exists:
+        # 更新现有频道
+        update_fields = []
+        params = []
+        
+        if display_name is not None:
+            update_fields.append("display_name = ?")
+            params.append(display_name)
+        
+        if logo_url is not None:
+            update_fields.append("logo_url = ?")
+            params.append(logo_url)
+        
+        if epg_id is not None:
+            update_fields.append("epg_id = ?")
+            params.append(epg_id)
+        
+        if group_title is not None:
+            update_fields.append("group_title = ?")
+            params.append(group_title)
+        
+        if update_fields:
+            params.append(channel_id)
+            query = f"UPDATE channel_info SET {', '.join(update_fields)} WHERE channel_id = ?"
+            cursor.execute(query, params)
+    else:
+        # 插入新频道
+        cursor.execute("""
+        INSERT INTO channel_info 
+        (channel_id, display_name, logo_url, epg_id, group_title)
+        VALUES (?, ?, ?, ?, ?)
+        """, (channel_id, display_name, logo_url, epg_id, group_title))
+    
+    conn.commit()
+    conn.close()
+    return True
+
+# Flask路由定义
+@app.route('/')
+def index():
+    """首页，显示基本状态"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    # 获取频道总数
+    cursor.execute("SELECT COUNT(DISTINCT channel_id) as count FROM channel_sources")
+    channel_count = cursor.fetchone()['count']
+    
+    # 获取频道分组
+    cursor.execute("""
+    SELECT group_title, COUNT(*) as count 
+    FROM channel_info 
+    GROUP BY group_title 
+    ORDER BY count DESC
+    """)
+    groups = [dict(row) for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    # 简化的HTML页面
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>IPTV代理服务器</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            h1, h2 {{ color: #2c3e50; }}
+            .card {{ background: #f9f9f9; border-radius: 5px; padding: 15px; margin-bottom: 15px; }}
+        </style>
+    </head>
+    <body>
+        <h1>IPTV代理服务器</h1>
+        <div class="card">
+            <p>总频道数: <strong>{channel_count}</strong></p>
+            <p>频道分组数: <strong>{len(groups)}</strong></p>
+        </div>
+        
+        <h2>播放列表链接</h2>
+        <div class="card">
+            <p><a href="/playlist.m3u">所有频道播放列表</a></p>
+            {''.join([f'<p><a href="/playlist.m3u?group={g.get("group_title", "")}">{g.get("group_title", "未分组")}播放列表</a></p>' for g in groups])}
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html
+
+@app.route('/playlist.m3u')
+def get_playlist():
+    """生成M3U播放列表"""
+    group = request.args.get('group')
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    # 构建查询条件
+    query = """
+    SELECT cs.channel_id, ci.display_name, ci.logo_url, ci.group_title
+    FROM channel_sources cs
+    LEFT JOIN channel_info ci ON cs.channel_id = ci.channel_id
+    """
+    params = []
+    
+    if group:
+        query += " WHERE ci.group_title = ?"
+        params.append(group)
+    
+    query += " GROUP BY cs.channel_id ORDER BY ci.group_title, ci.display_name"
+    
+    cursor.execute(query, params)
+    channels = cursor.fetchall()
+    conn.close()
+    
+    # 生成M3U内容
+    m3u_content = "#EXTM3U\n"
+    server_url = request.url_root.rstrip('/')
+    
+    for channel in channels:
+        channel_id = channel['channel_id']
+        name = channel['display_name'] or channel_id
+        group_title = channel['group_title'] or '其他'
+        logo = f' tvg-logo="{channel["logo_url"]}"' if channel.get("logo_url") else ""
+        
+        m3u_content += f'#EXTINF:-1 tvg-id="{channel_id}"{logo} group-title="{group_title}", {name}\n'
+        m3u_content += f'{server_url}/proxy/channel/{channel_id}\n'
+    
+    return Response(m3u_content, mimetype='audio/x-mpegurl')
+
+@app.route('/proxy/channel/<channel_id>')
+def route_proxy_channel(channel_id):
+    """代理频道流"""
+    return proxy_stream(channel_id)
+
+@app.route('/proxy/segment/<channel_id>')
+def route_proxy_segment(channel_id):
+    """代理分段"""
+    return proxy_segment(channel_id)
+
+@app.route('/admin/add_channel_info', methods=['POST'])
+def route_add_channel_info():
+    """添加或更新频道信息"""
+    # 检查授权
+    auth_key = request.headers.get('X-Auth-Key')
+    if auth_key != os.environ.get('ADMIN_KEY', 'changeme'):
+        return jsonify({"error": "未授权"}), 401
+    
+    data = request.json
+    if not data or 'channel_id' not in data:
+        return jsonify({"error": "缺少频道ID"}), 400
+    
+    result = add_channel_info(
+        data['channel_id'],
+        display_name=data.get('display_name'),
+        logo_url=data.get('logo_url'),
+        epg_id=data.get('epg_id'),
+        group_title=data.get('group_title')
+    )
+    
+    return jsonify({"success": result})
+
+@app.route('/admin/add_source', methods=['POST'])
+def route_add_source():
+    """添加频道源"""
+    # 检查授权
+    auth_key = request.headers.get('X-Auth-Key')
+    if auth_key != os.environ.get('ADMIN_KEY', 'changeme'):
+        return jsonify({"error": "未授权"}), 401
+    
+    data = request.json
+    if not data or 'channel_id' not in data or 'url' not in data:
+        return jsonify({"error": "缺少必要参数"}), 400
+    
+    status = add_channel_source(
+        data['channel_id'],
+        data['url'],
+        priority=data.get('priority', 100)
+    )
+    
+    return jsonify({"status": status})
+
+@app.route('/admin/add_mytv_token', methods=['POST'])
+def route_add_mytv_token():
+    """添加MyTV Super token"""
+    # 检查授权
+    auth_key = request.headers.get('X-Auth-Key')
+    if auth_key != os.environ.get('ADMIN_KEY', 'changeme'):
+        return jsonify({"error": "未授权"}), 401
+    
+    data = request.json
+    if not data or 'token' not in data:
+        return jsonify({"error": "缺少token参数"}), 400
+    
+    add_mytv_token(data['token'], data.get('expiry'))
+    return jsonify({"success": True})
+
+def clean_cache():
+    """清理过期缓存"""
+    try:
+        now = time.time()
+        cache_cleaned = 0
+        
+        for filename in os.listdir(CACHE_DIR):
+            if filename.endswith('.ts') or filename.endswith('.stream'):
+                file_path = os.path.join(CACHE_DIR, filename)
+                file_age = now - os.path.getmtime(file_path)
+                
+                if file_age > CACHE_TTL:
+                    try:
+                        os.remove(file_path)
+                        cache_cleaned += 1
+                    except:
+                        pass
+        
+        logger.info(f"缓存清理完成，删除了 {cache_cleaned} 个过期文件")
+    except Exception as e:
+        logger.error(f"缓存清理错误: {str(e)}")
+
+def main():
+    """启动代理服务器"""
+    # 初始化数据库
+    init_database()
+    
+    # 启动定期清理缓存的线程
+    def clean_cache_task():
+        while True:
+            clean_cache()
+            time.sleep(3600)  # 每小时清理一次
+    
+    # 启动清理线程
+    threading.Thread(target=clean_cache_task, daemon=True).start()
+    
+    # 启动Flask应用
+    logger.info("IPTV代理服务器启动中...")
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
+if __name__ == "__main__":
+    main()
